@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import Client from "./AdminLoginClient";
+import Client from "./AcceptInviteClient";
 
 export default function Page() {
   return (

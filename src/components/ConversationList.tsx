@@ -2,6 +2,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import type { CSSProperties } from "react";
 
 type Item = {
   conversationId: string;
@@ -12,7 +13,23 @@ type Item = {
   lastTime: string;
   assignedSellerId?: string | null;
   deliveryStatus?: string | null;
+  unreadCount?: number;
+  isUnread?: boolean;
+  pulse?: boolean;
+  seen?: boolean;
+  isSeen?: boolean;
 };
+
+function initialsFromName(name: string | undefined | null): string {
+  const n = (name || "").trim();
+  if (!n) return "CU";
+  const parts = n.split(/\s+/).filter(Boolean);
+  const takeChar = (s: string) => Array.from(s)[0] || "";
+  if (parts.length >= 2) return (takeChar(parts[0]) + takeChar(parts[1])).toUpperCase();
+  const chars = Array.from(parts[0]);
+  return (chars.slice(0, 2).join("") || "CU").toUpperCase();
+}
+
 
 export default function ConversationList({
   items,
@@ -57,6 +74,69 @@ export default function ConversationList({
     if (x === "delivered") return "delevered";
     if (x === "cancel") return "cancle";
     return x;
+  };
+
+  const normalizeStatus = (v?: string | null) => {
+    const x = String(v || "confirmed").trim().toLowerCase();
+    // Be tolerant to common typos / variants
+    if (x === "cancle" || x === "cancelled") return "cancel";
+    if (x === "delevered") return "delivered";
+    if (x === "onhold" || x === "on_hold" || x === "on-hold") return "hold";
+    
+    return x;
+  };
+
+  const statusChipStyle = (v?: string | null): CSSProperties => {
+    const x = normalizeStatus(v);
+
+    // Use inline styles so Tailwind class-purging / JIT issues can't break colors.
+    // cancel -> red, hold -> yellow, delivered -> green, confirmed -> blue
+    if (x === "cancel") {
+      return { backgroundColor: "#FEF2F2", color: "#B91C1C", borderColor: "#FCA5A5" };
+    }
+    if (x === "hold") {
+      return { backgroundColor: "#FFFBEB", color: "#92400E", borderColor: "#FCD34D" };
+    }
+    if (x === "delivered") {
+      return { backgroundColor: "#ECFDF5", color: "#047857", borderColor: "#6EE7B7" };
+    }
+    // confirmed (default)
+    return { backgroundColor: "#EFF6FF", color: "#1D4ED8", borderColor: "#93C5FD" };
+  };
+
+  const hasUnread = (c: Item) => {
+    // Prefer explicit seen flags if present
+    if (typeof (c as any).seen === "boolean") return !(c as any).seen;
+    if (typeof (c as any).isSeen === "boolean") return !(c as any).isSeen;
+
+    // Backend unreadCount only counts customer messages. In UI, be tolerant to either field.
+    if (typeof c.unreadCount === "number") return c.unreadCount > 0;
+    return Boolean(c.isUnread);
+  };
+
+  const UnreadDot = ({ show, pulse }: { show: boolean; pulse?: boolean }) => {
+    // IMPORTANT:
+    // - Keep a fixed-size container always mounted so the layout never shifts.
+    // - Use inline styles for visibility so the dot reliably hides even if Tailwind
+    //   class generation/purging ever misses opacity utilities.
+    return (
+      <span
+        aria-label={pulse ? "New unread" : "Unread"}
+        aria-hidden={!show}
+        className="inline-flex w-3 shrink-0 items-center justify-center select-none"
+      >
+        <span
+          className={[pulse && show ? "animate-pulse" : "", "text-sm leading-5"].join(" ")}
+          style={{
+            opacity: show ? 1 : 0,
+            transition: "opacity 200ms",
+            color: "#3B82F6", // tailwind blue-500
+          }}
+        >
+          ⏺
+        </span>
+      </span>
+    );
   };
 
   return (
@@ -115,6 +195,7 @@ export default function ConversationList({
               key={c.conversationId}
               onClick={() => onSelect(c.conversationId)}
               className={[
+                "chat-anim-fade-in",
                 "group w-full text-left px-4 py-3 border-b border-gray-100 transition",
                 "hover:bg-gray-50",
                 isActive ? "bg-gray-50 border-l-2 border-l-gray-900" : "bg-white border-l-2 border-l-transparent",
@@ -124,7 +205,7 @@ export default function ConversationList({
                 {/* Avatar */}
                 <div
                   className={[
-                    "w-10 h-10 rounded-full bg-gray-200 flex-shrink-0 overflow-hidden",
+                    "w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center flex-shrink-0 overflow-hidden relative",
                     isActive ? "ring-2 ring-gray-900/10" : "ring-1 ring-gray-900/5",
                   ].join(" ")}
                 >
@@ -134,19 +215,27 @@ export default function ConversationList({
                       alt={c.customerName || "Customer"}
                       className="w-full h-full object-cover"
                     />
-                  ) : null}
-                </div>
+                  ) : (
+                    <span className="text-xs font-semibold text-gray-700 select-none">
+                      {initialsFromName(c.customerName)}
+                    </span>
+                  )}
+</div>
 
                 {/* Content */}
                 <div className="min-w-0 flex-1">
                   {/* Row 1: Name / (Seller: Status update) */}
                   <div className="flex items-center justify-between gap-3">
-                    <div
-                      className="min-w-0 truncate text-sm font-semibold leading-5 text-gray-900"
-                      title={c.customerName || c.conversationId}
-                    >
-                      {c.customerName || c.conversationId}
-                    </div>
+                    <div className="min-w-0 flex items-center gap-2">
+                      {/* Customer name (bold when unread) + unread indicator dot on the right */}
+                      <span
+                        className={["min-w-0 truncate text-sm leading-5 text-gray-900", hasUnread(c) ? "font-bold" : "font-normal"].join(" ")}
+                        title={c.customerName || c.conversationId}
+                      >
+                        {c.customerName || c.conversationId}
+                      </span>
+                      <UnreadDot show={hasUnread(c)} pulse={c.pulse} />
+</div>
 
                     {/* Seller status menu moved to inbox header (ChatWindow) */}
                     {null}
@@ -154,11 +243,13 @@ export default function ConversationList({
 
                   {/* Row 2: Message + Time (both) */}
                   <div className="mt-1 flex items-center justify-between gap-3">
-                    <div className="min-w-0 truncate text-xs text-gray-600" title={c.lastMessage}>
+                    <div className={["min-w-0 truncate text-xs", hasUnread(c) ? "text-gray-900 font-medium" : "text-gray-600"].join(" ")} title={c.lastMessage}>
                       {c.lastMessage}
                     </div>
                     <div className="shrink-0 whitespace-nowrap text-[11px] text-gray-400">
-                      {new Date(c.lastTime).toLocaleString()}
+                      <div className="flex items-center gap-2">
+                        <span>{new Date(c.lastTime).toLocaleString()}</span>
+                      </div>
                     </div>
                   </div>
 
@@ -172,7 +263,13 @@ export default function ConversationList({
                         </span>
                       </span>
 
-                      <span className="inline-flex items-center gap-1 rounded-md bg-gray-50 px-2 py-1 text-[11px] font-medium text-gray-700 ring-1 ring-inset ring-gray-200">
+                      <span
+                        style={statusChipStyle(c.deliveryStatus)}
+                        className={[
+                          "inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium border",
+                          
+                        ].join(" ")}
+                      >
                         <span className="text-gray-500">Status:</span>
                         <span>{statusLabel(c.deliveryStatus)}</span>
                       </span>
@@ -183,7 +280,13 @@ export default function ConversationList({
                     </div>
                   ) : (
                     <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <span className="inline-flex items-center gap-1 rounded-md bg-gray-50 px-2 py-1 text-[11px] font-medium text-gray-700 ring-1 ring-inset ring-gray-200">
+                      <span
+                        style={statusChipStyle(c.deliveryStatus)}
+                        className={[
+                          "inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium border",
+                          
+                        ].join(" ")}
+                      >
                         <span className="text-gray-500">Status:</span>
                         <span>{statusLabel(c.deliveryStatus)}</span>
                       </span>

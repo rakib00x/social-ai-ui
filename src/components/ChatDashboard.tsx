@@ -32,6 +32,8 @@ export default function ChatDashboard() {
   const router = useRouter();
 
   const [conversations, setConversations] = useState<ConversationsMap>({});
+  // Conversation summaries (from /conversations) include unreadCount/isUnread
+  const [conversationList, setConversationList] = useState<Array<any>>([]);
   const [conversationMeta, setConversationMeta] = useState<
     Record<string, { assignedSellerId: string | null; deliveryStatus?: string | null; assignedAt?: string | null }>
   >({});
@@ -42,6 +44,21 @@ export default function ChatDashboard() {
   >([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Read marker (per conversation) returned by GET /messages/:conversationId
+  // Used for messenger-style "Seen ✓" indicators in the chat window.
+  const [readAtByConversation, setReadAtByConversation] = useState<Record<string, string | null>>({});
+
+  // Customer receipt markers (per conversation) returned by GET /messages/:conversationId
+  // Used for WhatsApp-like ✓✓ on outgoing agent messages.
+  const [customerReadAtByConversation, setCustomerReadAtByConversation] = useState<Record<string, string | null>>({});
+
+  // Local "read" override for the sidebar unread indicator.
+  // Rationale: we optimistically clear unread when a thread is opened,
+  // but the polling "/conversations" refresh may lag and re-introduce
+  // stale unreadCount values. This override keeps the dot hidden until
+  // a new customer message arrives.
+  const readOverrideRef = useRef<Record<string, boolean>>({});
 
   // ✅ Responsive breakpoint helper.
   // Desktop (md+) keeps the old behavior (auto-select a thread).
@@ -61,9 +78,7 @@ export default function ChatDashboard() {
   }, []);
 
   // ✅ API base
-  // const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000";
-  const API = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000";
-
+  const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000";
 
   // ✅ auth headers
   // Admin pages can authenticate either by:
@@ -166,6 +181,9 @@ export default function ChatDashboard() {
         // API may return either an array directly or { data: [...] }
         const conversationsFromDb: Array<any> = Array.isArray(convJson) ? convJson : (convJson?.data || []);
 
+        // Keep the list payload (contains unreadCount/isUnread)
+        setConversationList(conversationsFromDb);
+
         // store assignment/meta for admin UI
         const meta: Record<string, any> = {};
         conversationsFromDb.forEach((c) => {
@@ -188,7 +206,11 @@ export default function ChatDashboard() {
                 { headers: authHeaders, cache: "no-store" }
               );
               const msgJson = await msgRes.json();
-              map[c.conversationId] = Array.isArray(msgJson) ? msgJson : (msgJson?.data || []);
+              const list = Array.isArray(msgJson) ? msgJson : (msgJson?.data || []);
+              map[c.conversationId] = list;
+              if (!Array.isArray(msgJson) && Object.prototype.hasOwnProperty.call(msgJson || {}, "readAt")) {
+                setReadAtByConversation((prev) => ({ ...prev, [c.conversationId]: msgJson.readAt ?? null }));
+              }
             } catch {
               map[c.conversationId] = [];
             }
@@ -220,10 +242,66 @@ export default function ChatDashboard() {
     const onAnyLive = (msg: LiveMsg) => {
       if (!msg?.conversationId) return;
 
+      // Only increment unread for customer messages when the thread is not currently active.
+      const isCustomer = String((msg as any)?.sender || "").toLowerCase() === "customer";
+      const shouldIncUnread = isCustomer && String(activeId || "") !== String(msg.conversationId);
+      if (shouldIncUnread) {
+        // New unread message should re-enable the dot.
+        delete readOverrideRef.current[msg.conversationId];
+      }
+
       setConversations((prev) => {
         const list = prev[msg.conversationId] || [];
         return { ...prev, [msg.conversationId]: [...list, msg] };
       });
+
+      // Update conversation list preview + unread counts
+      setConversationList((prev) => {
+        const rows = Array.isArray(prev) ? [...prev] : [];
+        const idx = rows.findIndex((r: any) => String(r?.conversationId) === String(msg.conversationId));
+
+        const patch = {
+          conversationId: msg.conversationId,
+          customerName: (msg as any)?.customerName,
+          customerProfilePic: (msg as any)?.customerProfilePic,
+          platform: (msg as any)?.platform,
+          pageId: (msg as any)?.pageId,
+          lastMessage: (msg as any)?.message,
+          lastTime: (msg as any)?.timestamp,
+        } as any;
+
+        if (idx >= 0) {
+          const cur = rows[idx] || {};
+          const nextUnread = shouldIncUnread ? Number(cur.unreadCount || 0) + 1 : Number(cur.unreadCount || 0);
+          rows[idx] = {
+            ...cur,
+            ...patch,
+            unreadCount: nextUnread,
+            isUnread: nextUnread > 0,
+            pulse: shouldIncUnread ? true : false,
+          };
+          return rows;
+        }
+
+        // New thread that wasn't in list yet
+        rows.unshift({
+          ...patch,
+          unreadCount: shouldIncUnread ? 1 : 0,
+          isUnread: shouldIncUnread,
+          pulse: shouldIncUnread ? true : false,
+        });
+        return rows;
+      });
+
+      if (shouldIncUnread) {
+        window.setTimeout(() => {
+          setConversationList((prev) =>
+            (prev || []).map((c: any) =>
+              String(c?.conversationId) === String(msg.conversationId) ? { ...c, pulse: false } : c
+            )
+          );
+        }, 1400);
+      }
 
       // If nothing selected yet, auto focus ONLY on desktop.
       if (isDesktop) {
@@ -233,9 +311,7 @@ export default function ChatDashboard() {
 
     // ✅ listen to both event names (backend may emit either)
     socket.on("new_message", onAnyLive);
-    socket.on("live_message", onAnyLive);
-
-    // 🔔 assignment/status updates (admin actions)
+// 🔔 assignment/status updates (admin actions)
     const onMeta = (m: any) => {
       if (!m?.conversationId) return;
       setConversationMeta((prev) => ({
@@ -266,10 +342,9 @@ export default function ChatDashboard() {
     return () => {
       socket.off("connect");
       socket.off("new_message", onAnyLive);
-      socket.off("live_message", onAnyLive);
-      socket.off("conversation_meta", onMeta);
+socket.off("conversation_meta", onMeta);
     };
-  }, [isDesktop, isAdminPath, currentSellerId]);
+  }, [isDesktop, isAdminPath, currentSellerId, activeId]);
 
   // 2.5) ✅ Poll conversation list so NEW threads show even if sockets are blocked
   useEffect(() => {
@@ -303,6 +378,26 @@ export default function ChatDashboard() {
           return next;
         });
 
+        // update conversation list (includes unreadCount/isUnread)
+        // Apply local read overrides so the unread dot stays hidden after opening a thread
+        // even if the server list is slow to reflect markRead.
+        const overridden = rows.map((r: any) => {
+          const id = String(r?.conversationId || "");
+          if (!id) return r;
+
+          const serverUnread = Number(r?.unreadCount || 0) > 0 || !!r?.isUnread;
+          const isActiveThread = String(activeId || "") === id;
+
+          // If polling reports a new unread while we had an override, drop the override (unless this thread is currently open).
+          if (readOverrideRef.current[id] && serverUnread && !isActiveThread) {
+            delete readOverrideRef.current[id];
+          }
+
+          if (readOverrideRef.current[id]) return { ...r, unreadCount: 0, isUnread: false, pulse: false };
+          return r;
+        });
+        setConversationList(overridden);
+
         const ids = rows.map((r) => r.conversationId).filter(Boolean);
 
         // ✅ For sellers: if a conversation disappears from server list (e.g. re-assigned), remove it locally
@@ -329,6 +424,9 @@ export default function ChatDashboard() {
               );
               const msgJson = await msgRes.json();
               additions[id] = Array.isArray(msgJson) ? msgJson : (msgJson?.data || []);
+              if (!Array.isArray(msgJson) && Object.prototype.hasOwnProperty.call(msgJson || {}, "readAt")) {
+                setReadAtByConversation((prev) => ({ ...prev, [id]: msgJson.readAt ?? null }));
+              }
             } catch {
               additions[id] = [];
             }
@@ -347,7 +445,7 @@ export default function ChatDashboard() {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [API, authHeaders, conversations]);
+  }, [API, authHeaders, conversations, activeId]);
 
   // ✅ Desktop auto-select: pick newest conversation when none is selected.
   useEffect(() => {
@@ -386,6 +484,9 @@ export default function ChatDashboard() {
         const list = normalize(json);
         if (cancelled) return;
         setConversations((prev) => ({ ...prev, [activeId]: list }));
+        if (!Array.isArray(json) && Object.prototype.hasOwnProperty.call(json || {}, "readAt")) {
+          setReadAtByConversation((prev) => ({ ...prev, [activeId]: json.readAt ?? null }));
+        }
       } catch {
         // ignore
       }
@@ -401,23 +502,26 @@ export default function ChatDashboard() {
   }, [activeId, API, authHeaders]);
   // ✅ sidebar list items derived from conversations
   const sidebarItems = useMemo(() => {
-    const ids = Object.keys(conversations);
-
-    const rows = ids
-      .map((conversationId) => {
+    const rows = (conversationList || [])
+      .filter((c) => !!c?.conversationId)
+      .map((c) => {
+        const conversationId = String(c.conversationId);
         const list = conversations[conversationId] || [];
-        const last = list[list.length - 1];
+        const last = list[list.length - 1] as any;
+        const meta = conversationMeta[conversationId] || {};
 
-        const meta = conversationMeta[conversationId];
         return {
           conversationId,
-          customerName: last?.customerName || "Customer",
-          customerProfilePic: last?.customerProfilePic || "",
-          platform: last?.platform || "unknown",
-          lastMessage: last?.message || "",
-          lastTime: last?.timestamp || new Date().toISOString(),
-          assignedSellerId: meta?.assignedSellerId || null,
-          deliveryStatus: meta?.deliveryStatus || null,
+          customerName: last?.customerName || c.customerName || "Customer",
+          customerProfilePic: last?.customerProfilePic || c.customerProfilePic || "",
+          platform: last?.platform || c.platform || "unknown",
+          pageId: last?.pageId || c.pageId || "",
+          lastMessage: last?.message || c.lastMessage || "",
+          lastTime: last?.timestamp || c.lastTime || new Date().toISOString(),
+          assignedSellerId: meta.assignedSellerId ?? c.assignedSellerId ?? null,
+          deliveryStatus: meta.deliveryStatus ?? c.deliveryStatus ?? null,
+          unreadCount: Number(c.unreadCount || 0),
+          isUnread: !!c.isUnread || Number(c.unreadCount || 0) > 0,
         };
       })
       // ✅ Seller side hard filter (prevents cached threads from staying visible)
@@ -431,7 +535,7 @@ export default function ChatDashboard() {
       .sort((a, b) => new Date(b.lastTime).getTime() - new Date(a.lastTime).getTime());
 
     return rows;
-  }, [conversations, conversationMeta, isAdminPath, currentSellerId]);
+  }, [conversationList, conversations, conversationMeta, isAdminPath, currentSellerId]);
 
   const updateMeta = async (
     conversationId: string,
@@ -467,7 +571,19 @@ export default function ChatDashboard() {
   };
 
   const activeMessages = activeId ? conversations[activeId] || [] : [];
-  const activeTitle = activeId ? `${activeMessages[activeMessages.length - 1]?.customerName || activeId}` : "Select a customer";
+  
+  const activeOnline: boolean | null = useMemo(() => {
+    if (!activeId) return null;
+    const row = (conversationList || []).find((c: any) => String(c?.conversationId) === String(activeId));
+    const v =
+      row?.customerOnline ??
+      row?.isOnline ??
+      row?.online ??
+      (typeof row?.status === "string" ? row.status.toLowerCase() === "online" : null);
+    return typeof v === "boolean" ? v : null;
+  }, [activeId, conversationList]);
+
+const activeTitle = activeId ? `${activeMessages[activeMessages.length - 1]?.customerName || activeId}` : "Select a customer";
   const activeProfilePic = activeId ? (activeMessages[activeMessages.length - 1]?.customerProfilePic || "") : "";
   const conversationTargets = useMemo(() => {
     const ids = Object.keys(conversations || {});
@@ -490,19 +606,84 @@ export default function ChatDashboard() {
   // - Desktop: list + chat side-by-side
   const showChatOnMobile = !!activeId;
 
+  const openConversation = async (id: string) => {
+    setActiveId(id);
+
+    // Optimistically treat this thread as read in the sidebar.
+    readOverrideRef.current[id] = true;
+
+    // Mark read (server) + refresh messages for this thread
+    try {
+      const msgRes = await fetch(
+        `${API}/api/social-ai-bot/messages/${encodeURIComponent(id)}?markRead=1`,
+        { headers: authHeaders, cache: "no-store" }
+      );
+      if (msgRes.ok) {
+        const msgJson = await msgRes.json().catch(() => []);
+        const list = Array.isArray(msgJson) ? msgJson : (msgJson?.data || []);
+        setConversations((prev) => ({ ...prev, [id]: list }));
+
+        if (!Array.isArray(msgJson) && Object.prototype.hasOwnProperty.call(msgJson || {}, "readAt")) {
+          setReadAtByConversation((prev) => ({ ...prev, [id]: msgJson.readAt ?? null }));
+        }
+
+        if (!Array.isArray(msgJson) && Object.prototype.hasOwnProperty.call(msgJson || {}, "customerReadAt")) {
+          setCustomerReadAtByConversation((prev) => ({ ...prev, [id]: msgJson.customerReadAt ?? null }));
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // Optimistically clear unread in list UI
+    setConversationList((prev) =>
+      (prev || []).map((c: any) =>
+        String(c?.conversationId) === String(id) ? { ...c, unreadCount: 0, isUnread: false, pulse: false } : c
+      )
+    );
+  };
+
+  const markUnread = async (id: string) => {
+    try {
+      const res = await fetch(
+        `${API}/api/social-ai-bot/conversations/${encodeURIComponent(id)}/mark-unread`,
+        { method: "POST", headers: authHeaders }
+      );
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setConversationList((prev) =>
+          (prev || []).map((c: any) =>
+            String(c?.conversationId) === String(id)
+              ? { ...c, unreadCount: Number(json?.unreadCount || 0), isUnread: !!json?.isUnread }
+              : c
+          )
+        );
+
+        // Clear local read marker as well
+        if (Object.prototype.hasOwnProperty.call(json || {}, "readAt")) {
+          setReadAtByConversation((prev) => ({ ...prev, [id]: json.readAt ?? null }));
+        } else {
+          setReadAtByConversation((prev) => ({ ...prev, [id]: null }));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   return (
     <div className="h-full min-h-0 grid grid-cols-12">
       {/* Conversation List */}
       <div
         className={[
-          "col-span-12 md:col-span-3 bg-white border-r border-[#000000]",
+          "col-span-12 md:col-span-3 bg-white border-r border-[#d5d5d5]",
           showChatOnMobile ? "hidden md:block" : "block",
         ].join(" ")}
       >
         <ConversationList
           items={sidebarItems}
           activeId={activeId}
-          onSelect={(id) => setActiveId(id)}
+          onSelect={(id) => openConversation(id)}
           isAdmin={!!isAdminPath}
           sellers={sellers}
           onUpdateMeta={updateMeta}
@@ -526,6 +707,8 @@ export default function ChatDashboard() {
             title={activeTitle}
             profilePic={activeProfilePic}
             messages={activeMessages}
+            readAt={activeId ? (readAtByConversation?.[activeId] ?? null) : null}
+            customerReadAt={activeId ? (customerReadAtByConversation?.[activeId] ?? null) : null}
             forwardTargets={conversationTargets}
 
             conversationId={activeId}
@@ -533,7 +716,9 @@ export default function ChatDashboard() {
             sellers={sellers}
             assignedSellerId={activeId ? (conversationMeta?.[activeId]?.assignedSellerId ?? null) : null}
             deliveryStatus={activeId ? (conversationMeta?.[activeId]?.deliveryStatus ?? null) : null}
+            customerOnline={activeOnline}
             onUpdateMeta={updateMeta}
+            onMarkUnread={(cid) => markUnread(cid)}
             onSent={() => {
               if (!activeId) return;
               fetch(`${API}/api/social-ai-bot/messages/${encodeURIComponent(activeId)}`, {
@@ -545,6 +730,14 @@ export default function ChatDashboard() {
                   if (!json) return;
                   const list = Array.isArray(json) ? json : (json?.data || []);
                   setConversations((prev) => ({ ...prev, [activeId]: list }));
+
+                  if (!Array.isArray(json) && Object.prototype.hasOwnProperty.call(json || {}, "readAt")) {
+                    setReadAtByConversation((prev) => ({ ...prev, [activeId]: json.readAt ?? null }));
+                  }
+
+                  if (!Array.isArray(json) && Object.prototype.hasOwnProperty.call(json || {}, "customerReadAt")) {
+                    setCustomerReadAtByConversation((prev) => ({ ...prev, [activeId]: json.customerReadAt ?? null }));
+                  }
                 })
                 .catch(() => {});
             }}

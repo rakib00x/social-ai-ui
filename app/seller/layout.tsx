@@ -69,7 +69,7 @@ export default function SellerLayout({ children }: { children: React.ReactNode }
   const Sidebar = (
     <div className="h-full bg-white border-r border-black/10">
 
-      <p className="text-[#adadad]">ui/app/seller/layout.tsx</p>
+      
       <div className="p-2 border-b border-black/10">
         <div className="text-lg font-bold">Seller Panel</div>
         <div className="text-xs text-gray-500 mt-1">{sellerName}</div>

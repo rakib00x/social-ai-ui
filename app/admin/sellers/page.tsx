@@ -47,9 +47,7 @@ async function safeReadJsonMessage(res: Response): Promise<string> {
 
 export default function SellersPage() {
   const API_BASE = useMemo(
-    // () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000",
-    () => process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000",
-
+    () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000",
     []
   );
 
@@ -77,7 +75,7 @@ export default function SellersPage() {
 
   const fileRef = useRef<HTMLInputElement | null>(null);
 
-  const header = useMemo(() => `👨‍💼 Create Seller`, []);
+  const header = useMemo(() => `Create Seller`, []);
 
   const persistAdminKey = (val: string) => {
     setAdminKey(val);
@@ -235,23 +233,19 @@ export default function SellersPage() {
 
   return (
     <div className="p-5">
-      <p className="text-[#afa2a6]">ui/app/admin/sellers/page.tsx</p>
+ 
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="text-[#ff2a6d] font-bold text-2xl">{header}</div>
           
-          <div className="text-gray-600 mt-1">(Saved in MongoDB ✅)</div>
+          <div className="text-gray-600 mt-1">(Saved in MySql✅)</div>
         </div>
       </div>
 
       {/* Admin key (ছোট + ডিজাইন-বান্ধব) */}
       <div className="mt-5 bg-white border border-black/10 rounded-2xl p-4">
         <div className="text-sm font-semibold">Admin API Key here (x-admin-key)</div>
-        <div className="text-xs text-gray-500 mt-1">
-          Backend এর <code>ai-bot/.env</code> ফাইলে যে <code>ADMIN_API_KEY</code>
-          আছে—ঠিক সেটা এখানে দিবেন।
-        </div>
-
+       
         <div className="mt-3 flex flex-col md:flex-row gap-3">
           <input
             value={adminKey}

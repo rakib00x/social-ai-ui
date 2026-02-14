@@ -5,10 +5,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LiveMsg } from "@/types/chat";
 
+function getInitials(name: string): string {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return "?";
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  const first = parts[0] ? Array.from(parts[0])[0] : "";
+  const second = parts.length > 1 ? Array.from(parts[1])[0] : "";
+  return (first + second).toUpperCase();
+}
+
+
+type PendingSend = {
+  localId: string;
+  msg: LiveMsg;
+  state: "sending" | "sent";
+};
+
 export default function ChatWindow({
   title,
   profilePic,
   messages,
+  readAt,
+  customerReadAt,
   conversationId,
   forwardTargets,
 
@@ -19,11 +37,15 @@ export default function ChatWindow({
   sellers,
   assignedSellerId,
   deliveryStatus,
+  customerOnline,
   onUpdateMeta,
+  onMarkUnread,
 }: {
   title: string;
   profilePic?: string;
   messages: LiveMsg[];
+  readAt?: string | null;
+  customerReadAt?: string | null;
   conversationId: string | null;
   forwardTargets?: Array<{ conversationId: string; title: string; profilePic?: string }>;
 
@@ -34,11 +56,11 @@ export default function ChatWindow({
   sellers?: Array<{ _id?: string; id?: string; name?: string; firstName?: string; lastName?: string; email?: string }>;
   assignedSellerId?: string | null;
   deliveryStatus?: string | null;
+  customerOnline?: boolean | null;
   onUpdateMeta?: (conversationId: string, patch: { sellerId?: string | null; deliveryStatus?: string }) => void;
+  onMarkUnread?: (conversationId: string) => void;
 }) {
-  // const API = process.env.NEXT_PUBLIC_API_BASE || process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
-  const API = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000";
-
+  const API = process.env.NEXT_PUBLIC_API_BASE || process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
 
   const authHeaders = useMemo(() => {
     try {
@@ -60,13 +82,398 @@ export default function ChatWindow({
     return {} as Record<string, string>;
   }, [isAdmin]);;
 
-  const [text, setText] = useState("");
+  // Read marker time used to render an "unseen" dot next to message bubbles.
+  const readAtMs = useMemo(() => {
+    try {
+      if (!readAt) return 0;
+      const t = new Date(readAt).getTime();
+      return Number.isFinite(t) ? t : 0;
+    } catch {
+      return 0;
+    }
+  }, [readAt]);
+
+  // Customer read receipt (platform watermark) used for ✓✓ on outgoing agent messages.
+  const customerReadAtMs = useMemo(() => {
+    try {
+      if (!customerReadAt) return 0;
+      const t = new Date(customerReadAt).getTime();
+      return Number.isFinite(t) ? t : 0;
+    } catch {
+      return 0;
+    }
+  }, [customerReadAt]);
+
+  // Show the unread indicator ONLY on the latest inbound (customer) message.
+  // This mirrors common chat UX: a single dot indicates there is something new,
+  // without cluttering every unread bubble.
+  const lastUnseenCustomerMsgKey = useMemo(() => {
+    try {
+      if (!Array.isArray(messages) || messages.length === 0) return null;
+
+      // Find the most recent customer message.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i] as any;
+        const isBot = m?.sender === "bot";
+        if (isBot) continue;
+
+        const msgMs = m?.timestamp ? new Date(m.timestamp).getTime() : 0;
+        const isSeen = !!readAtMs && !!msgMs && msgMs <= readAtMs;
+
+        if (isSeen) return null;
+
+        // Unseen: return its key (must match the msgKey used in the render loop).
+        return String(m?.id ?? m?.messageId ?? `${i}-${m?.timestamp ?? ""}`);
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }, [messages, readAtMs]);
+
+  
+  // --- Media parsing helpers (for reply preview / rendering) ---
+  const toAbsoluteMediaUrl = (u: string) => {
+    const url = (u || "").trim();
+    if (!url) return "";
+    if (url.startsWith("http://") || url.startsWith("https://")) return url;
+    if (url.startsWith("/")) return `${API}${url}`;
+    return `${API}/${url}`;
+  };
+
+  const isImageUrl = (u: string) => {
+    const url = u.toLowerCase();
+    return (
+      url.includes(".png") ||
+      url.includes(".jpg") ||
+      url.includes(".jpeg") ||
+      url.includes(".gif") ||
+      url.includes(".webp") ||
+      url.includes("image/")
+    );
+  };
+
+  const extractUrlsFromText = (s: string) => {
+    const out: string[] = [];
+    const str = String(s || "");
+    // Pull urls from lines first (common saved format: "Images:\n/uploads/..")
+    for (const line of str.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      if (t.startsWith("/uploads/") || t.startsWith("http://") || t.startsWith("https://")) out.push(t);
+    }
+    // Also catch inline urls
+    const reUrl = /(https?:\/\/[^\s]+|\/uploads\/[^\s]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = reUrl.exec(str))) out.push(m[1]);
+    // de-dupe
+    return Array.from(new Set(out));
+  };
+
+  const parseMediaMessage = (msg: string) => {
+    const raw = String(msg || "");
+    const urls = extractUrlsFromText(raw).map(toAbsoluteMediaUrl).filter(Boolean);
+    const images = urls.filter(isImageUrl);
+    return { images, urls, raw };
+  };
+
+const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  // Optimistic outgoing messages so agent can see delivery state immediately.
+  const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
+  const [replyTo, setReplyTo] = useState<LiveMsg | null>(null);
+  const dragStateRef = useRef<{ id: string | null; startX: number; delta: number }>({ id: null, startX: 0, delta: 0 });
+  const [draggingMsgId, setDraggingMsgId] = useState<string | null>(null);
+  const [dragDeltaX, setDragDeltaX] = useState<number>(0);
+
+// 🔎 In-chat search
+const [searchOpen, setSearchOpen] = useState(false);
+const [searchQ, setSearchQ] = useState("");
+const [activeMatch, setActiveMatch] = useState(0);
+const msgRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+const normalizedSearch = searchQ.trim().toLowerCase();
+const matchKeys = useMemo(() => {
+  if (!normalizedSearch) return [] as string[];
+  const keys: string[] = [];
+  messages.forEach((m, idx) => {
+    const hay = String(m.message || "").toLowerCase();
+    if (hay.includes(normalizedSearch)) {
+      const k = String(m.id ?? (m as any).messageId ?? `${idx}-${m.timestamp ?? ""}`);
+      keys.push(k);
+    }
+  });
+  return keys;
+}, [messages, normalizedSearch]);
+
+const matchSet = useMemo(() => new Set(matchKeys), [matchKeys]);
+
+const jumpToMatch = (i: number) => {
+  if (!matchKeys.length) return;
+  const next = (i + matchKeys.length) % matchKeys.length;
+  setActiveMatch(next);
+  const key = matchKeys[next];
+  const el = msgRefs.current[key];
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+};
+
+useEffect(() => {
+  // When query changes, jump to first match
+  if (normalizedSearch && matchKeys.length) {
+    setActiveMatch(0);
+    const el = msgRefs.current[matchKeys[0]];
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  if (normalizedSearch && !matchKeys.length) setActiveMatch(0);
+}, [normalizedSearch, matchKeys.length]);
 
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [errMsg, setErrMsg] = useState<string>("");
+
+  // ✅ Saved templates (quick replies)
+  type SavedTemplate = {
+    id: number;
+    scope: 'global' | 'seller';
+    title: string;
+    type: 'text' | 'media';
+    text?: string;
+    mediaUrls?: string[];
+    updatedAt?: any;
+  };
+  const [savedOpen, setSavedOpen] = useState(false);
+  const [savedLoading, setSavedLoading] = useState(false);
+  const [savedErr, setSavedErr] = useState<string>("");
+  const [savedQ, setSavedQ] = useState("");
+  const [savedType, setSavedType] = useState<'all' | 'text' | 'media'>('all');
+  const [savedItems, setSavedItems] = useState<SavedTemplate[]>([]);
+  const [editItem, setEditItem] = useState<SavedTemplate | null>(null);
+
+  const [newTitle, setNewTitle] = useState("");
+  const [newText, setNewText] = useState("");
+  const [newFiles, setNewFiles] = useState<File[]>([]);
+  const newFilesRef = useRef<HTMLInputElement | null>(null);
+
+  const loadTemplates = async (opts?: { q?: string; type?: 'all' | 'text' | 'media' }) => {
+    try {
+      setSavedErr("");
+      setSavedLoading(true);
+      const q = String(opts?.q ?? savedQ).trim();
+      const t = opts?.type ?? savedType;
+      const usp = new URLSearchParams();
+      if (q) usp.set('q', q);
+      if (t !== 'all') usp.set('type', t);
+      const res = await fetch(`${API}/api/templates?${usp.toString()}`, {
+        headers: { ...authHeaders },
+      });
+      const txt = await res.text();
+      if (!res.ok) {
+        setSavedErr(txt || 'Failed to load templates');
+        return;
+      }
+      const data = JSON.parse(txt || '[]');
+      setSavedItems(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Failed to load templates');
+    } finally {
+      setSavedLoading(false);
+    }
+  };
+
+  const openSaved = async () => {
+    setSavedOpen(true);
+    setEditItem(null);
+    await loadTemplates({ q: savedQ, type: savedType });
+  };
+
+  const createTextTemplate = async () => {
+    try {
+      setSavedErr("");
+      const title = newTitle.trim();
+      const text = newText.trim();
+      if (!title || !text) {
+        setSavedErr('title + text required');
+        return;
+      }
+      const res = await fetch(`${API}/api/templates/text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({ title, text }),
+      });
+      const t = await res.text();
+      if (!res.ok) {
+        setSavedErr(t || 'Create failed');
+        return;
+      }
+      setNewTitle('');
+      setNewText('');
+      await loadTemplates();
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Create failed');
+    }
+  };
+
+  const createMediaTemplate = async () => {
+    try {
+      setSavedErr("");
+      const title = newTitle.trim();
+      if (!title) {
+        setSavedErr('title required');
+        return;
+      }
+      if (!newFiles.length) {
+        setSavedErr('select at least 1 file');
+        return;
+      }
+      const form = new FormData();
+      form.append('title', title);
+      newFiles.forEach((f) => form.append('files', f));
+      const res = await fetch(`${API}/api/templates/media`, {
+        method: 'POST',
+        headers: { ...authHeaders },
+        body: form,
+      });
+      const t = await res.text();
+      if (!res.ok) {
+        setSavedErr(t || 'Create failed');
+        return;
+      }
+      setNewTitle('');
+      setNewFiles([]);
+      if (newFilesRef.current) newFilesRef.current.value = '';
+      await loadTemplates();
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Create failed');
+    }
+  };
+
+  const updateTemplate = async (item: SavedTemplate, patch: Partial<SavedTemplate> & { mediaFiles?: File[] }) => {
+    try {
+      setSavedErr("");
+      if (!item?.id) return;
+
+      // If mediaFiles provided -> multipart replace
+      if (patch.mediaFiles && patch.mediaFiles.length) {
+        const form = new FormData();
+        form.append('title', String(patch.title ?? item.title));
+        patch.mediaFiles.forEach((f) => form.append('files', f));
+        const res = await fetch(`${API}/api/templates/${item.id}`, {
+          method: 'PUT',
+          headers: { ...authHeaders },
+          body: form,
+        });
+        const t = await res.text();
+        if (!res.ok) {
+          setSavedErr(t || 'Update failed');
+          return;
+        }
+      } else {
+        const res = await fetch(`${API}/api/templates/${item.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', ...authHeaders },
+          body: JSON.stringify({ title: patch.title ?? item.title, text: patch.text ?? item.text, mediaUrls: patch.mediaUrls ?? item.mediaUrls }),
+        });
+        const t = await res.text();
+        if (!res.ok) {
+          setSavedErr(t || 'Update failed');
+          return;
+        }
+      }
+
+      setEditItem(null);
+      await loadTemplates();
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Update failed');
+    }
+  };
+
+  const deleteTemplate = async (id: number) => {
+    try {
+      setSavedErr("");
+      const res = await fetch(`${API}/api/templates/${id}`, {
+        method: 'DELETE',
+        headers: { ...authHeaders },
+      });
+      const t = await res.text();
+      if (!res.ok) {
+        setSavedErr(t || 'Delete failed');
+        return;
+      }
+      await loadTemplates();
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Delete failed');
+    }
+  };
+
+  const sendTemplate = async (tpl: SavedTemplate) => {
+    if (!conversationId) {
+      setSavedErr('Select a conversation first');
+      return;
+    }
+    try {
+      setSavedErr("");
+      setSending(true);
+
+      if (tpl.type === 'text') {
+        const msg = String(tpl.text || '').trim();
+        if (!msg) {
+          setSavedErr('Template is empty');
+          return;
+        }
+        const res = await fetch(`${API}/api/social-ai-bot/manual-reply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders },
+          body: JSON.stringify({ conversationId, message: msg, replyToMessageId: (replyTo as any)?.id || null }),
+        });
+        const t = await res.text();
+        if (!res.ok) {
+          setSavedErr(t || 'Send failed');
+          return;
+        }
+        onSent?.();
+        return;
+      }
+
+      // media: download from /uploads then re-upload via existing endpoint
+      const urls = Array.isArray(tpl.mediaUrls) ? tpl.mediaUrls : [];
+      if (!urls.length) {
+        setSavedErr('No media in template');
+        return;
+      }
+
+      const blobs: File[] = [];
+      for (let i = 0; i < urls.length; i++) {
+        const u = String(urls[i] || '');
+        const abs = u.startsWith('/uploads/') ? `${API}${u}` : u;
+        const r = await fetch(abs);
+        if (!r.ok) throw new Error(`Failed to fetch media (${i + 1})`);
+        const b = await r.blob();
+        const name = u.split('/').pop() || `file-${i + 1}`;
+        blobs.push(new File([b], name, { type: b.type || 'application/octet-stream' }));
+      }
+
+      const form = new FormData();
+      form.append('conversationId', conversationId);
+      blobs.forEach((f) => form.append('files', f));
+      const res = await fetch(`${API}/api/social-ai-bot/manual-media-reply`, {
+        method: 'POST',
+        headers: { ...authHeaders },
+        body: form,
+      });
+      const t = await res.text();
+      if (!res.ok) {
+        setSavedErr(t || 'Send failed');
+        return;
+      }
+      onSent?.();
+    } catch (e: any) {
+      setSavedErr(e?.message || 'Send failed');
+    } finally {
+      setSending(false);
+    }
+  };
 
   // ✅ Forward message (send an existing bubble to another conversation)
   const [forwardOpen, setForwardOpen] = useState(false);
@@ -117,6 +524,57 @@ export default function ChatWindow({
 
 
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  const pendingByKey = useMemo(() => {
+    const map = new Map<string, PendingSend>();
+    (pendingSends || []).forEach((p) => map.set(p.localId, p));
+    return map;
+  }, [pendingSends]);
+
+  // Merge optimistic messages into the render list (sorted by timestamp).
+  const displayMessages = useMemo(() => {
+    const base = Array.isArray(messages) ? [...messages] : [];
+    const pending = (pendingSends || [])
+      .filter((p) => !conversationId || String(p.msg.conversationId) === String(conversationId))
+      .map((p) => ({ ...(p.msg as any), __localId: p.localId }));
+    const all = base.concat(pending as any);
+    all.sort((a: any, b: any) => {
+      const ta = a?.timestamp ? new Date(a.timestamp).getTime() : 0;
+      const tb = b?.timestamp ? new Date(b.timestamp).getTime() : 0;
+      return ta - tb;
+    });
+    return all as LiveMsg[];
+  }, [messages, pendingSends, conversationId]);
+
+  const pendingStateByLocalId = useMemo(() => {
+    const map: Record<string, "sending" | "sent"> = {};
+    (pendingSends || []).forEach((p) => {
+      map[p.localId] = p.state;
+    });
+    return map;
+  }, [pendingSends]);
+
+  // When server messages arrive, remove optimistic entries that are already persisted.
+  useEffect(() => {
+    if (!pendingSends.length) return;
+    const serverBots = (Array.isArray(messages) ? messages : []).filter((m) => m?.sender === "bot");
+    if (!serverBots.length) return;
+
+    setPendingSends((prev) =>
+      (prev || []).filter((p) => {
+        if (p.state !== "sent") return true;
+        const pt = p.msg?.timestamp ? new Date(p.msg.timestamp).getTime() : 0;
+        const match = serverBots.some((m) => {
+          if (String(m?.conversationId) !== String(p.msg?.conversationId)) return false;
+          if (String(m?.message || "") !== String(p.msg?.message || "")) return false;
+          const mt = m?.timestamp ? new Date(m.timestamp).getTime() : 0;
+          // allow some clock/network skew
+          return mt >= pt - 30_000;
+        });
+        return !match;
+      })
+    );
+  }, [messages, pendingSends.length]);
 
   // ✅ Extract ALL URLs from message text
   const extractAllUrls = (t: string) => {
@@ -249,11 +707,33 @@ export default function ChatWindow({
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+  }, [displayMessages.length]);
 
   const handleSendText = async () => {
     const msg = text.trim();
     if (!msg || !conversationId) return;
+
+    const localId = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const nowIso = new Date().toISOString();
+
+    // Try to infer platform/pageId from existing messages (fallbacks keep backward compat).
+    const last = Array.isArray(messages) && messages.length ? (messages[messages.length - 1] as any) : ({} as any);
+    const optimistic: LiveMsg = {
+      conversationId,
+      customerName: title || last?.customerName || "Customer",
+      customerProfilePic: profilePic || last?.customerProfilePic,
+      sender: "bot",
+      senderRole: isAdmin ? "admin" : "seller",
+      senderName: isAdmin ? "Admin" : "Seller",
+      message: msg,
+      platform: (last?.platform as any) || "facebook",
+      pageId: String(last?.pageId || ""),
+      replyToMessageId: (replyTo as any)?.id || null,
+      timestamp: nowIso,
+    };
+
+    // Show it immediately in the thread; ticks will update on success.
+    setPendingSends((prev) => [...(prev || []), { localId, msg: optimistic, state: "sending" }]);
 
     try {
       setErrMsg("");
@@ -262,21 +742,30 @@ export default function ChatWindow({
       const res = await fetch(`${API}/api/social-ai-bot/manual-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders },
-        body: JSON.stringify({ conversationId, message: msg }),
+        body: JSON.stringify({ conversationId, message: msg, replyToMessageId: (replyTo as any)?.id || null }),
       });
 
       if (!res.ok) {
         const t = await res.text();
         console.error("manual-reply failed:", t);
         setErrMsg(t || "Send failed");
+        // Remove optimistic on failure
+        setPendingSends((prev) => (prev || []).filter((p) => p.localId !== localId));
         return;
       }
 
+      // Mark sent: show double tick. Server refresh will later replace this optimistic item.
+      setPendingSends((prev) =>
+        (prev || []).map((p) => (p.localId === localId ? { ...p, state: "sent" } : p))
+      );
+
       setText("");
+        setReplyTo(null);
       onSent?.();
     } catch (e: any) {
       console.error(e);
       setErrMsg(e?.message || "Send failed");
+      setPendingSends((prev) => (prev || []).filter((p) => p.localId !== localId));
     } finally {
       setSending(false);
     }
@@ -291,7 +780,6 @@ export default function ChatWindow({
 
       const form = new FormData();
       form.append("conversationId", conversationId);
-
       // ✅ multiple append
       files.forEach((f) => form.append("files", f));
 
@@ -309,6 +797,7 @@ export default function ChatWindow({
       }
 
       setFiles([]);
+        setReplyTo(null);
       onSent?.();
     } catch (e: any) {
       console.error(e);
@@ -325,6 +814,14 @@ export default function ChatWindow({
   };
 
   const headerId = useMemo(() => conversationId || "", [conversationId]);
+
+  const msgById = useMemo(() => {
+    const map = new Map<string, LiveMsg>();
+    for (const m of messages || []) {
+      if ((m as any)?.id != null) map.set(String((m as any).id), m);
+    }
+    return map;
+  }, [messages]);
 
   const sellerLabel = (s: any) => {
     const full = [s?.firstName, s?.lastName].filter(Boolean).join(" ").trim();
@@ -344,10 +841,119 @@ export default function ChatWindow({
     return x;
   };
 
+  // ✅ Local editor for a saved item
+  const EditSavedItem = ({
+    item,
+    onSave,
+    onClose,
+  }: {
+    API: string;
+    authHeaders: Record<string, string>;
+    item: SavedTemplate;
+    onSave: (patch: Partial<SavedTemplate> & { mediaFiles?: File[] }) => void;
+    onClose: () => void;
+  }) => {
+    const [title, setTitle] = useState<string>(String(item.title || ""));
+    const [txt, setTxt] = useState<string>(String(item.text || ""));
+    const [mediaUrls, setMediaUrls] = useState<string[]>(Array.isArray(item.mediaUrls) ? item.mediaUrls.map(String) : []);
+    const [mediaFiles, setMediaFiles] = useState<File[]>([]);
+    const replRef = useRef<HTMLInputElement | null>(null);
+
+    return (
+      <div className="mt-3 rounded-xl border border-gray-200 p-3">
+        {/* Keep edit fields compact (50% on desktop, full on mobile) */}
+        <div className="w-full md:w-1/2">
+          <input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="h-10 w-full rounded-md border border-gray-300 px-2 text-sm"
+            placeholder="title"
+          />
+        </div>
+
+        {item.type === 'text' ? (
+          <textarea
+            value={txt}
+            onChange={(e) => setTxt(e.target.value)}
+            className="mt-2 w-full md:w-1/2 min-h-[90px] rounded-md border border-gray-300 p-2 text-sm"
+            placeholder="text"
+          />
+        ) : (
+          <div className="mt-2">
+            <div className="text-xs text-gray-600 mb-1">Current media</div>
+            {mediaUrls.length ? (
+              <div className="space-y-1">
+                {mediaUrls.map((u, idx) => (
+                  <div key={`murl-${idx}`} className="flex items-center justify-between gap-2 text-xs">
+                    <div className="truncate text-gray-700 flex-1">{u}</div>
+                    <button
+                      type="button"
+                      className="px-2 py-0.5 rounded-md border border-gray-300 hover:bg-gray-50"
+                      onClick={() => setMediaUrls(mediaUrls.filter((_, i) => i !== idx))}
+                    >
+                      remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-500">No media URLs</div>
+            )}
+
+            <input
+              ref={replRef}
+              type="file"
+              multiple
+              accept="image/*,video/*"
+              className="hidden"
+              onChange={(e) => setMediaFiles(Array.from(e.target.files || []))}
+            />
+            <div className="mt-2 flex flex-wrap gap-2 items-center">
+              <button
+                type="button"
+                className="h-9 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                onClick={() => replRef.current?.click()}
+              >
+                Replace files
+              </button>
+              {mediaFiles.length ? (
+                <div className="text-xs text-gray-600">selected: {mediaFiles.length} file(s)</div>
+              ) : null}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="h-9 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+            onClick={() =>
+              onSave({
+                title,
+                text: item.type === 'text' ? txt : undefined,
+                mediaUrls: item.type === 'media' ? mediaUrls : undefined,
+                mediaFiles: item.type === 'media' ? mediaFiles : undefined,
+              })
+            }
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            className="h-9 px-3 rounded-md border border-gray-300 bg-white text-sm hover:bg-gray-100"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
-    <div className="h-full min-h-0 flex flex-col">
+    <div className="relative h-full min-h-0 flex flex-col">
       {/* Customer ID show Header */}
-      <div className="border-b border-[#000000]">
+      <div className="border-b border-[#f1f1f1]">
 
 
         {/* This code for ui comment 
@@ -361,12 +967,29 @@ export default function ChatWindow({
               <div className="w-10 h-10 rounded-full bg-gray-200 overflow-hidden flex-shrink-0">
               {profilePic ? (
                 <img src={profilePic} alt={title || "Customer"} className="w-full h-full object-cover" />
-              ) : null}
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-gray-700 font-semibold">
+                  {getInitials(title || "Customer")}
+                </div>
+              )}
             </div>
               <div className="text-[#1a070d] font-semibold text-xl truncate">
                 {title || headerId}
               </div>
             </div>
+
+            {/* Read/unread control (seller view). Admin gets this inside Actions menu. 
+            {conversationId && onMarkUnread && !isAdmin ? (
+              <button
+                type="button"
+                className="h-10 px-3 rounded-md border border-gray-300 bg-white text-xs hover:bg-gray-100"
+                onClick={() => onMarkUnread(conversationId)}
+              >
+                Mark unread
+              </button>
+            ) : null}
+
+            */}
 
             {/* ✅ Admin-only: Actions menu moved to inbox header (next to customer name) */}
             {isAdmin && conversationId ? (
@@ -383,6 +1006,10 @@ export default function ChatWindow({
                     (e.target as HTMLSelectElement).value = "";
 
                     if (!v) return;
+                    if (v === "mark-unread") {
+                      onMarkUnread?.(conversationId);
+                      return;
+                    }
                     if (v === "unassign") {
                       onUpdateMeta?.(conversationId, { sellerId: null });
                       return;
@@ -410,6 +1037,12 @@ export default function ChatWindow({
                   <option key="unassign" value="unassign">
                     Unassign ({assignedSellerName(assignedSellerId)})
                   </option>
+
+                  {onMarkUnread ? (
+                    <option key="mark-unread" value="mark-unread">
+                      Mark unread
+                    </option>
+                  ) : null}
                 </select>
               </div>
             ) : null}
@@ -458,7 +1091,7 @@ export default function ChatWindow({
           onMouseDown={() => closePreview()}
         >
           <div
-            className="relative w-full max-w-5xl rounded-2xl bg-white border-2 border-black p-3"
+            className="relative w-full max-w-5xl rounded-2xl bg-white border-2 border-black p-3 chat-anim-modal"
             onMouseDown={(e) => e.stopPropagation()}
           >
             <button
@@ -488,6 +1121,229 @@ export default function ChatWindow({
         </div>
       ) : null}
 
+      {/* ✅ Saved templates (Quick Reply) panel: bottom sheet (does NOT cover the full screen) */}
+      {savedOpen ? (
+        <div className="absolute inset-0 z-50">
+          {/* Backdrop (only covers chat pane) */}
+          <div
+            className="absolute inset-0 bg-black/20"
+            onClick={() => {
+              if (sending) return;
+              setSavedOpen(false);
+              setEditItem(null);
+            }}
+          />
+
+          {/* Bottom sheet */}
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-3 flex justify-center">
+
+            <div className="w-full md:w-1/2 h-[50vh] md:h-[45vh] overflow-hidden rounded-2xl bg-white border-2 border-black shadow-2xl flex flex-col chat-anim-modal">
+
+            <div className="flex items-center justify-between gap-3 p-4 border-b border-gray-200 shrink-0">
+              <div className="text-lg font-semibold">Saved items</div>
+              <button
+                type="button"
+                className="px-3 py-1 rounded-lg border border-black bg-white text-sm hover:bg-gray-100"
+                onClick={() => {
+                  if (sending) return;
+                  setSavedOpen(false);
+                  setEditItem(null);
+                }}
+              >
+                Close
+              </button>
+            </div>
+
+            {/* Body (scrolls). Keep header fixed */}
+            <div className="p-4 flex-1 min-h-0 overflow-y-auto">
+	              <div className="flex flex-wrap items-center gap-2">
+              <input
+                value={savedQ}
+                onChange={(e) => setSavedQ(e.target.value)}
+                placeholder="search..."
+                className="h-10 flex-1 min-w-[180px] rounded-md border border-gray-300 px-2 text-sm"
+              />
+              <select
+                className="h-10 rounded-md border border-gray-300 px-2 text-sm"
+                value={savedType}
+                onChange={(e) => setSavedType(e.target.value as any)}
+              >
+                <option value="all">All</option>
+                <option value="text">Text</option>
+                <option value="media">Media</option>
+              </select>
+              <button
+                type="button"
+                className="h-10 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                onClick={() => loadTemplates({ q: savedQ, type: savedType })}
+                disabled={savedLoading}
+              >
+                Refresh
+              </button>
+            </div>
+
+	            {savedErr ? <div className="mt-2 text-sm text-red-600">{savedErr}</div> : null}
+
+            {/* Create new */}
+            <div className="mt-4 rounded-xl border border-gray-200 p-3">
+              <div className="text-sm font-semibold mb-2">Create new</div>
+	              {/* Keep input area visually compact (50% on desktop, full on mobile) */}
+	              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 items-start">
+	                <div className="w-full">
+	                  <input
+	                    value={newTitle}
+	                    onChange={(e) => setNewTitle(e.target.value)}
+	                    placeholder="title"
+	                    className="h-10 w-full rounded-md border border-gray-300 px-2 text-sm"
+	                  />
+	                  <textarea
+	                    value={newText}
+	                    onChange={(e) => setNewText(e.target.value)}
+	                    placeholder="text (leave empty if you are saving media)"
+	                    className="mt-2 w-full min-h-[90px] rounded-md border border-gray-300 p-2 text-sm"
+	                  />
+	                </div>
+
+	                <div className="w-full flex flex-col items-start gap-2">
+	                  <input
+                  ref={newFilesRef}
+                  type="file"
+                  multiple
+                  accept="image/*,video/*"
+                  className="hidden"
+                  onChange={(e) => setNewFiles(Array.from(e.target.files || []))}
+                />
+	                  <button
+                  type="button"
+                  className="h-10 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                  onClick={() => newFilesRef.current?.click()}
+                >
+                  Add media
+                </button>
+	                </div>
+	              </div>
+
+              {newFiles.length ? (
+                <div className="mt-2 text-xs text-gray-600">
+                  selected: {newFiles.length} file(s)
+                  <button className="ml-2 underline" onClick={() => {
+                    setNewFiles([]);
+                    if (newFilesRef.current) newFilesRef.current.value = '';
+                  }}>clear</button>
+                </div>
+              ) : null}
+
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="h-10 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                  onClick={createTextTemplate}
+                  disabled={savedLoading}
+                >
+                  Save text
+                </button>
+                <button
+                  type="button"
+                  className="h-10 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                  onClick={createMediaTemplate}
+                  disabled={savedLoading}
+                >
+                  Save media
+                </button>
+              </div>
+            </div>
+
+            {/* List */}
+	            <div className="mt-4 rounded-xl border border-gray-200 overflow-hidden">
+	              <div className="max-h-[45vh] overflow-auto">
+              {savedLoading ? (
+                <div className="p-3 text-sm text-gray-600">Loading...</div>
+              ) : savedItems.length === 0 ? (
+                <div className="p-3 text-sm text-gray-600">No saved items</div>
+              ) : (
+                <div className="divide-y divide-gray-200">
+                  {savedItems.map((it) => {
+                    const isEditing = editItem?.id === it.id;
+                    const isText = it.type === 'text';
+                    return (
+                      <div key={it.id} className="p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold truncate">{it.title}</div>
+                            <div className="text-xs text-gray-600">{it.type} • {it.scope}</div>
+                          </div>
+                          <div className="flex flex-wrap gap-2 shrink-0">
+                            <button
+                              type="button"
+                              className="h-9 px-3 rounded-md border border-black bg-white text-sm hover:bg-gray-100"
+                              onClick={() => sendTemplate(it)}
+                              disabled={!conversationId || sending}
+                            >
+                              Send
+                            </button>
+                            <button
+                              type="button"
+                              className="h-9 px-3 rounded-md border border-gray-300 bg-white text-sm hover:bg-gray-100"
+                              onClick={() => setEditItem(isEditing ? null : it)}
+                            >
+                              {isEditing ? 'Cancel' : 'Edit'}
+                            </button>
+                            <button
+                              type="button"
+                              className="h-9 px-3 rounded-md border border-red-400 bg-white text-sm hover:bg-red-50"
+                              onClick={() => {
+                                if (confirm('Delete this saved item?')) deleteTemplate(it.id);
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* preview */}
+                        {!isEditing ? (
+                          <div className="mt-2">
+                            {isText ? (
+                              <div className="text-sm whitespace-pre-wrap break-words text-gray-800 border border-gray-100 rounded-md p-2 bg-gray-50">
+                                {String(it.text || '')}
+                              </div>
+                            ) : (
+                              <div className="grid grid-cols-2 gap-2">
+                                {(it.mediaUrls || []).slice(0, 4).map((u, idx) => {
+                                  const url = String(u || '');
+                                  const isVid = /\.(mp4|mov|webm|avi|mkv)(\?|$)/i.test(url);
+                                  const src = url.startsWith('/uploads/') ? `${API}${url}` : url;
+                                  return isVid ? (
+                                    <video key={`${it.id}-m-${idx}`} src={src} controls className="w-full max-h-40 rounded-lg border border-black object-contain bg-white" />
+                                  ) : (
+                                    <img key={`${it.id}-m-${idx}`} src={src} className="w-full max-h-40 rounded-lg border border-black object-contain bg-white" />
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <EditSavedItem
+                            API={API}
+                            authHeaders={authHeaders}
+                            item={it}
+                            onSave={(patch) => updateTemplate(it, patch)}
+                            onClose={() => setEditItem(null)}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+	                </div>
+	              )}
+	              </div>
+	            </div>
+            </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {/* ✅ Forward modal */}
       {forwardOpen ? (
         <div
@@ -501,7 +1357,7 @@ export default function ChatWindow({
           }}
         >
           <div
-            className="w-full max-w-md rounded-xl bg-white border-2 border-black p-4"
+            className="w-full max-w-md rounded-xl bg-white border-2 border-black p-4 chat-anim-modal"
             onMouseDown={(e) => e.stopPropagation()}
           >
             <div className="text-lg font-semibold mb-2">Forward message</div>
@@ -557,9 +1413,16 @@ export default function ChatWindow({
       {/* Customer Messages Box */}
       <div ref={listRef} className="flex-1 min-h-0 overflow-auto px-4 py-4 md:px-8 md:py-6">
         <div className="space-y-6">
-          {messages.map((m, idx) => {
+          {displayMessages.map((m: any, idx) => {
+            const localId = (m as any)?.__localId ? String((m as any).__localId) : "";
+            const msgKey = localId || String(m.id ?? (m as any).messageId ?? `${idx}-${m.timestamp ?? ""}`);
+            const isMatch = normalizedSearch ? matchSet.has(msgKey) : false;
+            const isActive = normalizedSearch && matchKeys.length ? msgKey === matchKeys[activeMatch] : false;
             const isBot = m.sender === "bot";
             const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "";
+            const msgMs = m.timestamp ? new Date(m.timestamp).getTime() : 0;
+            const isCustomerMsg = !isBot; // inbound from customer
+            const isSeen = isCustomerMsg && !!readAtMs && !!msgMs && msgMs <= readAtMs;
 
             const senderLabel = (() => {
               if (!isBot) {
@@ -577,6 +1440,9 @@ export default function ChatWindow({
               // Legacy behavior: bot messages in admin panel were labelled "admin".
               return isAdmin ? "Admin" : "Seller";
             })();
+
+            const isAgentMessage = isBot && m.senderRole !== "ai";
+            const pendingState = localId ? pendingStateByLocalId[localId] : undefined;
 
             // ✅ Get all media items (images and videos mixed)
             const media = categorizeMediaUrls(m.message || "");
@@ -623,13 +1489,78 @@ export default function ChatWindow({
 
             return (
               <div
-                key={`${m.timestamp}-${idx}`}
-                className={["w-full flex", isBot ? "justify-end" : "justify-start"].join(" ")}
+                key={msgKey}
+                ref={(el) => {
+                  if (el) msgRefs.current[msgKey] = el;
+                  else delete msgRefs.current[msgKey];
+                }}
+                className={["w-full flex items-start gap-2", isBot ? "justify-end" : "justify-start"].join(" ")}
               >
-                <div
-                  className={[
+                {isBot ? (
+                  <button
+                    type="button"
+                    className="shrink-0 mt-2 text-[14px] text-gray-700 hover:text-black"
+                    onClick={() => setReplyTo(m)}
+                    title="Reply"
+                  >
+                    ↩
+                  </button>
+                ) : null}
+                <div className={["flex flex-col", isBot ? "items-end" : "items-start"].join(" ")}
+                >
+                  <div
+                  onPointerDown={(e) => {
+                    // If user is interacting with a button/link/input (e.g., forward/reply), don't start swipe-to-reply.
+                    const t = e.target as HTMLElement | null;
+                    if (t && t.closest("button, a, input, textarea, select, [role='button'], img, video")) return;
+
+                    // Ignore non-primary button drags on desktop
+                    // (touch has button === -1 in many browsers)
+                    if (typeof (e as any).button === "number" && (e as any).button > 0) return;
+                    dragStateRef.current = { id: msgKey, startX: e.clientX, delta: 0 };
+                    setDraggingMsgId(msgKey);
+                    setDragDeltaX(0);
+                    try {
+                      (e.currentTarget as any).setPointerCapture?.(e.pointerId);
+                    } catch {}
+                  }}
+                  onPointerMove={(e) => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    const dx = e.clientX - dragStateRef.current.startX;
+
+                    // WhatsApp-like: swipe RIGHT to reply on incoming; swipe LEFT to reply on outgoing.
+                    const unclamped = isBot ? Math.min(0, dx) : Math.max(0, dx);
+                    const clamped = Math.max(-80, Math.min(80, unclamped));
+
+                    dragStateRef.current.delta = clamped;
+                    setDragDeltaX(clamped);
+                  }}
+                  onPointerUp={() => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    const delta = dragStateRef.current.delta;
+                    const threshold = 60;
+
+                    const shouldReply = (!isBot && delta > threshold) || (isBot && delta < -threshold);
+                    dragStateRef.current = { id: null, startX: 0, delta: 0 };
+                    setDraggingMsgId(null);
+                    setDragDeltaX(0);
+
+                    if (shouldReply) setReplyTo(m);
+                  }}
+                  onPointerCancel={() => {
+                    if (dragStateRef.current.id !== msgKey) return;
+                    dragStateRef.current = { id: null, startX: 0, delta: 0 };
+                    setDraggingMsgId(null);
+                    setDragDeltaX(0);
+                  }}
+                  style={msgKey === draggingMsgId ? { transform: `translateX(${dragDeltaX}px)` } : undefined}
+                  className={[                    "max-w-[780px] px-5 py-4 text-sm leading-relaxed",
+
                     "max-w-[780px] px-5 py-4 text-sm leading-relaxed",
                     "border-2 border-black rounded-xl bg-white",
+                    "chat-anim-fade-in",
+                    isMatch ? "outline outline-4 outline-yellow-300" : "",
+                    isActive ? "outline-yellow-500" : "",
                     "transition-colors duration-150 hover:bg-gray-50",
                   ].join(" ")}
                 >
@@ -645,9 +1576,59 @@ export default function ChatWindow({
                           forward
                         </button>
                       ) : null}
-                      <div className="text-[11px] text-gray-500">{time}</div>
+                      <div className="flex items-center gap-2">
+                        <div className="text-[11px] text-gray-500">{time}</div>
+                        {/* Unseen indicator: show a single blue dot on the latest unread customer message */}
+                        {isCustomerMsg && !isSeen && msgKey === lastUnseenCustomerMsgKey ? (
+                          <span
+                            title="Unseen"
+                            className="inline-block h-2 w-2 rounded-full bg-blue-500"
+                          />
+                        ) : null}
+                      </div>
                     </div>
                   </div>
+
+
+                  {m.replyToMessageId ? (() => {
+                    const ref = msgById.get(String(m.replyToMessageId));
+                    if (!ref) return null;
+                    const refIsBot = ref.sender === "bot";
+                    const refLabel = (() => {
+                      if (!refIsBot) return (ref.senderName || ref.customerName || title || "Customer").trim();
+                      if (ref.senderName) return String(ref.senderName).trim();
+                      if (ref.senderRole === "admin") return "Admin";
+                      if (ref.senderRole === "seller") return "Seller";
+                      if (ref.senderRole === "ai") return "AI Bot";
+                      return isAdmin ? "Admin" : "Seller";
+                    })();
+                    const refMedia = parseMediaMessage(String(ref.message || ""));
+                    const refText = String(ref.message || "").replace(/\s+/g, " ").trim();
+                    return (
+                      <div className="mb-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                        <div className="text-[11px] font-semibold text-gray-700">{refLabel}</div>
+
+                        {refMedia.images.length > 0 ? (
+                          <div className="mt-2 flex items-center gap-2 overflow-hidden">
+                            {refMedia.images.slice(0, 3).map((u, i) => (
+                              <img
+                                key={`${u}-${i}`}
+                                src={u}
+                                alt="replied media"
+                                className="h-10 w-10 rounded-md border border-gray-200 object-cover bg-white"
+                                loading="lazy"
+                              />
+                            ))}
+                            {refMedia.images.length > 3 ? (
+                              <div className="text-[11px] text-gray-500">+{refMedia.images.length - 3}</div>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <div className="text-[12px] text-gray-600 truncate">{refText}</div>
+                        )}
+                      </div>
+                    );
+                  })() : null}
 
                   {/* ✅ Display text if available */}
                   {displayText && (
@@ -691,7 +1672,49 @@ export default function ChatWindow({
                   {!hasMedia && !displayText && (
                     <div className="whitespace-pre-wrap">{m.message}</div>
                   )}
-                </div>
+
+
+		        </div>
+
+		        {/* ✅ Delivery ticks (WhatsApp-like) for agent messages
+		            - ✓  : sending (optimistic)
+		            - ✓  : sent (API accepted)
+		            - ✓✓ : customer has read (platform receipt)
+		
+		            NOTE: readAt is used for the agent's own "unseen" markers.
+		            Customer read is provided by backend as `customerReadAt` (webhook watermark).
+		            Kept OUTSIDE the message bubble, and layout-stable. */}
+		        {isBot && String((m as any)?.senderRole || "") !== "ai" ? (
+		          <div className="mt-1 pr-1 flex justify-end text-[11px] text-gray-500 select-none">
+		            <span
+		              style={{
+		                opacity: localId && pendingStateByLocalId[localId] === "sending" ? 0.85 : 1,
+		              }}
+		            >
+		              {(() => {
+		                if (localId && pendingStateByLocalId[localId] === "sending") return "✓";
+		
+		                // Show ✓✓ only when the platform sends a read receipt (customerReadAt).
+		                // This avoids the historical bug where agent-side readAt would incorrectly flip ticks
+		                // when switching conversations.
+		                const msgMs = (m as any)?.timestamp ? new Date((m as any).timestamp).getTime() : 0;
+		                const isReadByCustomer = !!customerReadAtMs && !!msgMs && msgMs <= customerReadAtMs;
+		                return isReadByCustomer ? "✓✓" : "✓";
+		              })()}
+		            </span>
+		          </div>
+		        ) : null}
+		      </div>
+		      {!isBot ? (
+                  <button
+                    type="button"
+                    className="shrink-0 mt-2 text-[14px] text-gray-700 hover:text-black"
+                    onClick={() => setReplyTo(m)}
+                    title="Reply"
+                  >
+                    ↪
+                  </button>
+                ) : null}
               </div>
             );
           })}
@@ -701,9 +1724,123 @@ export default function ChatWindow({
       {/* Divider */}
       <div className="w-full border-t-2 border-black" />
 
-      {/* Bottom pill input (like screenshot) */}
-      <div className="px-4 md:px-16 pb-4 md:pb-6">
-        <div className="bg-[#2b2b2b] rounded-full px-4 py-3 flex items-center gap-3 shadow-inner">
+      {/* 🔎 Search bar */}
+{searchOpen ? (
+  <div className="px-4 md:px-16 pt-3">
+    <div className="flex items-center gap-2">
+      <div className="flex-1 bg-white rounded-full border-2 border-black px-4 py-2 flex items-center gap-2">
+        <span className="text-sm">🔎</span>
+        <input
+          value={searchQ}
+          onChange={(e) => setSearchQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") jumpToMatch(0);
+            if (e.key === "Escape") {
+              setSearchOpen(false);
+              setSearchQ("");
+            }
+          }}
+          placeholder="Search messages in this chat…"
+          className="flex-1 outline-none text-sm"
+        />
+        {normalizedSearch ? (
+          <span className="text-xs text-gray-600 whitespace-nowrap">
+            {matchKeys.length ? `${activeMatch + 1}/${matchKeys.length}` : "0/0"}
+          </span>
+        ) : null}
+      </div>
+
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center disabled:opacity-50"
+        title="Previous match"
+        disabled={!matchKeys.length}
+        onClick={() => jumpToMatch(activeMatch - 1)}
+      >
+        ‹
+      </button>
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center disabled:opacity-50"
+        title="Next match"
+        disabled={!matchKeys.length}
+        onClick={() => jumpToMatch(activeMatch + 1)}
+      >
+        ›
+      </button>
+
+      <button
+        type="button"
+        className="w-10 h-10 rounded-full border-2 border-black bg-white flex items-center justify-center"
+        title="Close search"
+        onClick={() => {
+          setSearchOpen(false);
+          setSearchQ("");
+        }}
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+) : null}
+
+{/* Reply preview (WhatsApp/Facebook style) */}
+{replyTo ? (
+  <div className="px-4 md:px-16 pt-3">
+    <div className="rounded-2xl border-2 border-black bg-white px-4 py-3 flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="text-xs font-semibold text-gray-800">
+          You replied to {(replyTo.sender === "customer"
+            ? (replyTo.senderName || replyTo.customerName || title || "Customer")
+            : (replyTo.senderName || (replyTo.senderRole === "admin" ? "Admin" : replyTo.senderRole === "seller" ? "Seller" : replyTo.senderRole === "ai" ? "AI Bot" : "Agent"))
+          )}
+        </div>
+        {(() => {
+          const pm = parseMediaMessage(String(replyTo.message || ""));
+          if (pm.images.length > 0) {
+            return (
+              <div className="mt-2 flex items-center gap-2 overflow-x-auto">
+                {pm.images.slice(0, 4).map((src, i) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={src + i}
+                    src={src}
+                    alt="reply preview"
+                    className="w-12 h-12 rounded-xl border-2 border-black object-cover flex-shrink-0"
+                  />
+                ))}
+                {pm.images.length > 4 ? (
+                  <div className="text-xs text-gray-600 whitespace-nowrap">+{pm.images.length - 4} more</div>
+                ) : null}
+              </div>
+            );
+          }
+          return (
+            <div className="text-xs text-gray-600 truncate mt-1">
+              {String(replyTo.message || "").replace(/\s+/g, " ").trim()}
+            </div>
+          );
+        })()}
+      </div>
+      <button
+        type="button"
+        className="w-8 h-8 rounded-full border-2 border-black bg-white flex items-center justify-center"
+        title="Cancel reply"
+        onClick={() => setReplyTo(null)}
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+) : null}
+
+ {/* Bottom pill input (like screenshot) */}
+      <div className="px-4 md:px-16 pb-4 md:pb-6 max-[360px]:px-3 max-[320px]:px-2">
+        <div
+          className="bg-[#2b2b2b] rounded-full px-4 py-3 flex items-center gap-3 shadow-inner
+                     max-[360px]:px-3 max-[360px]:py-2 max-[360px]:gap-2
+                     max-[320px]:px-2 max-[320px]:py-2 max-[320px]:gap-1.5"
+        >
           {/* hidden file input */}
           <input
             ref={fileInputRef}
@@ -720,7 +1857,9 @@ export default function ChatWindow({
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={!conversationId || sending}
-            className="w-10 h-10 rounded-full flex items-center justify-center text-white text-2xl hover:bg-[#3a3a3a] disabled:opacity-50"
+            className="w-10 h-10 rounded-full flex items-center justify-center text-white text-2xl hover:bg-[#3a3a3a] disabled:opacity-50
+                       max-[360px]:w-9 max-[360px]:h-9 max-[360px]:text-xl
+                       max-[320px]:w-8 max-[320px]:h-8 max-[320px]:text-lg"
             title="Attach"
           >
             +
@@ -735,24 +1874,59 @@ export default function ChatWindow({
             }}
             placeholder={files.length ? `selected: ${files.length} file(s)` : "type your message"}
             disabled={!conversationId || sending}
-            className="flex-1 bg-transparent outline-none text-white placeholder-gray-400 text-base"
+            className="flex-1 min-w-0 bg-transparent outline-none text-white placeholder-gray-400 text-base
+                       max-[360px]:text-sm
+                       max-[320px]:text-[13px]"
           />
+
+          {/* saved */}
+          <button
+            type="button"
+            onClick={openSaved}
+            disabled={sending}
+            className="w-10 h-10 rounded-full flex items-center justify-center text-white text-lg hover:bg-[#3a3a3a] disabled:opacity-50
+                       max-[360px]:w-9 max-[360px]:h-9 max-[360px]:text-base
+                       max-[320px]:w-8 max-[320px]:h-8 max-[320px]:text-[15px]"
+            title="Saved"
+          >
+            ★
+          </button>
+
+          {/* search */}
+          <button
+            type="button"
+            onClick={() => {
+              setSearchOpen(true);
+              // If user typed something in the message box and search is empty, use that as initial query.
+              // (Does not clear the message draft.)
+              if (!searchQ.trim() && text.trim()) setSearchQ(text.trim());
+            }}
+            disabled={!conversationId}
+            className="w-10 h-10 rounded-full flex items-center justify-center text-white text-lg hover:bg-[#3a3a3a] disabled:opacity-50
+                       max-[360px]:w-9 max-[360px]:h-9 max-[360px]:text-base
+                       max-[320px]:w-8 max-[320px]:h-8 max-[320px]:text-[15px]"
+            title="Search in chat"
+          >
+            🔎
+          </button>
 
           {/* send */}
           <button
             type="button"
             onClick={smartSend}
             disabled={!conversationId || sending || (!text.trim() && files.length === 0)}
-            className="w-10 h-10 rounded-full bg-white flex items-center justify-center disabled:opacity-50"
+            className="w-10 h-10 rounded-full bg-white flex items-center justify-center disabled:opacity-50
+                       max-[360px]:w-9 max-[360px]:h-9
+                       max-[320px]:w-8 max-[320px]:h-8"
             title="Send"
           >
-            ↑
+            <span className="text-black text-lg max-[360px]:text-base max-[320px]:text-[15px]">↑</span>
           </button>
         </div>
 
         {/* file + error */}
         {files.length > 0 && (
-          <div className="mt-2 text-sm text-gray-400">
+          <div className="mt-2 text-sm text-gray-400 max-[360px]:text-xs">
             Selected: <span className="font-medium">{files.length} file(s)</span>
             <button type="button" className="ml-2 underline" onClick={() => setFiles([])}>
               remove
@@ -761,7 +1935,7 @@ export default function ChatWindow({
         )}
 
         {errMsg && (
-          <div className="mt-2 text-sm text-red-600">
+          <div className="mt-2 text-sm text-red-600 max-[360px]:text-xs">
             {errMsg}
           </div>
         )}

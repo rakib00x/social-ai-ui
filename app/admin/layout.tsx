@@ -2,11 +2,14 @@
 
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { usePathname } from "next/navigation";
+
+const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:5000";
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
+  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
   const pathname = usePathname();
 
   // ✅ login page এ sidebar/topbar/drawer দেখাবে না
@@ -15,12 +18,60 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     pathname === "/admin" ||
     pathname?.startsWith("/admin/login/");
 
+  
+  useEffect(() => {
+    let cancelled = false;
+
+    const fallbackDecode = (token: string) => {
+      try {
+        const parts = token.split(".");
+        if (parts.length < 2) return false;
+        const payloadJson = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+        return payloadJson?.adminType === "super";
+      } catch {
+        return false;
+      }
+    };
+
+    const loadMe = async () => {
+      try {
+        const token = window.localStorage.getItem("admin_token_v1") || "";
+        if (!token) {
+          if (!cancelled) setIsSuperAdmin(false);
+          return;
+        }
+
+        // Prefer server truth (handles token refresh without full reload)
+        const res = await fetch(`${API}/api/admin/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const j = await res.json().catch(() => ({}));
+          if (!cancelled) setIsSuperAdmin(j?.adminType === "super");
+          return;
+        }
+
+        // Fallback: decode token (still fixes the "needs refresh" issue)
+        if (!cancelled) setIsSuperAdmin(fallbackDecode(token));
+      } catch {
+        const token = window.localStorage.getItem("admin_token_v1") || "";
+        if (!cancelled) setIsSuperAdmin(fallbackDecode(token));
+      }
+    };
+
+    loadMe();
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname]);
+
   const Sidebar = useMemo(
     () => (
       <div className="h-full bg-white border-r border-black/10">
         <div className="p-2 border-b border-black/10">
 
-        <p className="text-[#adadad]">ui/app/admin/layout.tsx</p>
+      
 
           <div className="text-xl font-bold">Admin Dashboard</div>
           <div className="text-xs text-gray-500 mt-1">Social AI Bot</div>
@@ -39,12 +90,28 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           >
             👥 Create Sellers
           </a>
-          <a
+          {/* <a
             href="/admin/seller"
             className="block px-4 py-3 rounded-lg border border-black/10 hover:bg-black hover:text-white transition"
           >
-            ⚙️ Api Intigration
+            ⚙️ Api Intigration---
+          </a> */}
+
+          <a
+            href="/admin/api"
+            className="block px-4 py-3 rounded-lg border border-black/10 hover:bg-black hover:text-white transition"
+          >
+            ⚙️ API Integration
           </a>
+          {isSuperAdmin ? (
+            <a
+              href="/admin/admin-management"
+              className="block px-4 py-3 rounded-lg border border-black/10 hover:bg-black hover:text-white transition"
+            >
+              👤 Admin Management
+            </a>
+          ) : null}
+
           <a
             href="/admin/logout"
             className="block px-4 py-3 rounded-lg border border-black/10 hover:bg-black hover:text-white transition"
@@ -54,7 +121,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         </nav>
       </div>
     ),
-    []
+    [isSuperAdmin]
   );
 
   // ✅ Login page: শুধু children (login form) center এ দেখাও

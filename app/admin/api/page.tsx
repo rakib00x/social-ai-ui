@@ -1,10 +1,10 @@
 import { Suspense } from "react";
-import Client from "./AdminLoginClient";
+import ApiIntegrationClient from "./ApiIntegrationClient";
 
 export default function Page() {
   return (
     <Suspense fallback={<div>Loading...</div>}>
-      <Client />
+      <ApiIntegrationClient />
     </Suspense>
   );
 }

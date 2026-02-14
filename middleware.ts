@@ -14,6 +14,9 @@ export function middleware(req: NextRequest) {
   // Allow admin login page
   if (pathname === "/admin/login") return NextResponse.next();
 
+  // Allow invite accept page (sub-admin sets password)
+  if (pathname === "/admin/accept-invite") return NextResponse.next();
+
   // Protect all seller routes
   if (pathname.startsWith("/seller")) {
     const token = req.cookies.get("seller_token_v1")?.value || "";
@@ -34,6 +37,25 @@ export function middleware(req: NextRequest) {
       const url = req.nextUrl.clone();
       url.pathname = "/admin/login";
       return NextResponse.redirect(url);
+    }
+
+    // Block sub-admins from Admin Management section (UI-level guard)
+    if (pathname.startsWith("/admin/admin-management")) {
+      try {
+        const parts = token.split(".");
+        const payload =
+          parts.length >= 2 ? JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))) : {};
+        const adminType = payload?.adminType || "super";
+        if (adminType !== "super") {
+          const url = req.nextUrl.clone();
+          url.pathname = "/admin/inbox";
+          return NextResponse.redirect(url);
+        }
+      } catch {
+        const url = req.nextUrl.clone();
+        url.pathname = "/admin/inbox";
+        return NextResponse.redirect(url);
+      }
     }
   }
 

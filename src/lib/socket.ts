@@ -1,12 +1,12 @@
-let socket: any = null;
+import { io, Socket } from "socket.io-client";
+
+let socket: Socket | null = null;
 
 export const getSocket = () => {
-  if (typeof window === "undefined") return null;
-
   if (!socket) {
+    // ✅ attach auth (seller token or admin key) so server can route events safely
     let token = "";
     let adminKey = "";
-
     try {
       const adminToken = localStorage.getItem("admin_token_v1") || "";
       const sellerToken = localStorage.getItem("seller_token_v1") || "";
@@ -16,14 +16,10 @@ export const getSocket = () => {
       // ignore
     }
 
-    const mod: any = require("socket.io-client");
-    const createIO = mod?.io || mod?.default || mod;
-
-    socket = createIO(process.env.NEXT_PUBLIC_SOCKET_URL as string, {
+    socket = io(process.env.NEXT_PUBLIC_SOCKET_URL as string, {
       transports: ["websocket"],
-      auth: { token, adminKey }
+      auth: { token, adminKey },
     });
   }
-
   return socket;
 };
